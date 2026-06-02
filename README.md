@@ -263,7 +263,7 @@ flowchart TD
 |---|---|
 | Kafka (비동기 통신) | 서비스 간 강결합 방지, 장애 격리, 재처리 용이 |
 | **Auth + User 통합** | **Kafka 동기화 제거 → 회원가입+인증을 단일 @Transactional로 보장, 운영 복잡도 감소** |
-| **OpenFeign 제거** | **Product Service 직접 스닉 호출 제거 → ProductSnapshot 로칼 조회로 의존성 차단** |
+| **OpenFeign 제거** | **Product Service 직접 스닉 호출 제거 → ProductSnapshot 조회로 의존성 차단** |
 | ProductSnapshot (Redis + DB) | 상품 정보를 Order Service 내 로칼에 커싱하여 빨른 주문 생성 지원 |
 | Redis Cache | 상품 조회 응답 속도 개선, ProductSnapshot 캐시 캐시 레이어 |
 | Resilience4j | 외부 서비스 장애 시 Cascade Failure 방지 |
