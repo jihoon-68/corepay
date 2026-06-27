@@ -9,11 +9,11 @@
 
 CorePay는 MSA(Microservices Architecture) 패턴을 적용한 결제 시스템입니다.
 사용자 인증, 상품 관리, 주문, 결제 등 실제 커머스 도메인을 독립된 서비스로 분리하여 구성하였으며,
-서비스 간 통신은 **Apache Kafka** 이벤트 스트리밍을 중심으로 사용합니다.
+서비스 간 통신은 **Apache Kafka** 이벤트 스트리밍과 **OpenFeign** 동기 호출을 목적에 맞게 혼용합니다.
 
 > 💡 **[v2 아키텍처 변경]**
 > - **Auth Service → User Service 통합**: 회원 관리와 JWT 인증을 단일 서비스에서 처리. `UserRegisterUseCase`가 `@Transactional` 하나로 User + Auth DB를 동시 저장하고 Kafka 이벤트 발행을 제거.
-> - **Order Service OpenFeign 제거**: Product Service 동기 호출 대신 **Kafka 이벤트로 동기화된 ProductSnapshot(Redis 캐시 + 로컬 DB)**을 조회하는 방식으로 대체.
+> - **상품 정보 조회 OpenFeign 제거**: Order Service가 Product Service를 직접 호출하던 방식 대신, **Kafka 이벤트로 동기화된 ProductSnapshot(Redis 캐시 + 로컬 DB)**을 조회하는 방식으로 대체. 재고 선점(`ProductStockClient`)과 결제 요청(`PaymentFeignClient`)은 실시간 처리가 필요하므로 OpenFeign 동기 호출 유지.
 
 > 💡 **[v3 아키텍처 변경]**
 > - **Outbox 패턴 도입**: Kafka 발행과 DB 저장을 동일 트랜잭션으로 묶어 이벤트 유실 원천 차단. 즉시 발행 성공 시 `SENT` 처리, 실패 시 `OutboxScheduler`가 30초마다 `PENDING` 이벤트를 재발행하는 이중 안전망 구조.
@@ -51,7 +51,7 @@ flowchart TD
 
     subgraph USER["👤 User Service (Auth 통합)"]
         U1["회원가입\nPOST /api/users/signup\nUserRegisterUseCase @Transactional"]
-        U2["UserService.creat()\n회원 DB 저장 (BCrypt)"]
+        U2["UserService.create()\n회원 DB 저장 (BCrypt)"]
         U3["AuthService.signup()\n인증용 AuthUser DB 저장"]
         U4["로그인\nPOST /api/auth/login\nJWT Access Token 발급"]
         U5["비밀번호 변경\nPOST /api/auth/update_password\n직접 DB 업데이트 (이벤트 없음)"]
@@ -81,9 +81,11 @@ flowchart TD
 
     subgraph ORDER["📋 Order Service"]
         O1["주문 생성\nPOST /api/orders"]
+        O1A["재고 선점\nProductStockClient (OpenFeign)"]
+        O1B["결제 요청\nPOST /api/orders/{id}/payment\nPaymentFeignClient (OpenFeign)"]
         O2["ProductSnapshotService\nRedis 요약본 조회\n미스 시 ProductSnapshot DB"]
-        O3["주문 이벤트\nOutbox → order-created-topic"]
-        O4["Kafka Consumer\npayment-completed/failed/cancelled-topic"]
+        O3["보상 이벤트 발행\nOutbox → stock-confirm/cancel-topic"]
+        O4["Kafka Consumer\npayment-refund-topic"]
         O5[("MySQL\n주문 DB")]
         O6[("MySQL\nProductSnapshot DB")]
         O7[("⚡ Redis\nProductSnapshot 캐시")]
@@ -91,15 +93,17 @@ flowchart TD
         O1 --> O2
         O2 <--> O7
         O2 --> O6
-        O1 --> O3
+        O1 --> O1A
+        O1A -->|"재고 선점 성공\nSTOCK_RESERVED"| O1B
+        O1B --> O3
         O3 --> OOUT
         O4 --> O5
         O1 --> O5
     end
 
     subgraph PAYMENT["💰 Payment Service"]
-        PA1["결제 처리\nKafka Consumer"]
-        PA2["결제 결과 이벤트\nOutbox → payment-completed/failed/cancelled-topic"]
+        PA1["결제 처리\nOpenFeign 수신 (BasicPaymentService)"]
+        PA2["결제 결과 반환\nHTTP 응답 → Order Service"]
         PA3[("MySQL\n결제 DB")]
         PA4[("⚡ Redis\n멱등성 처리\n중복 결제 방지")]
         PA5["Resilience4j\nCircuit Breaker"]
@@ -107,7 +111,6 @@ flowchart TD
         PA1 --> PA3
         PA1 <--> PA4
         PA1 --> PA2
-        PA2 --> PAOUT
         PA5 --> PA1
     end
 
@@ -119,12 +122,10 @@ flowchart TD
 
     subgraph KAFKA["📨 Apache Kafka"]
         K1["product-created-topic\n상품 생성 시 Order에 ProductSnapshot 동기화"]
-        K3["order-created-topic"]
-        K5["payment-completed-topic"]
-        K6["payment-failed-topic"]
-        K7["payment-cancelled-topic"]
-        K8["stock-increase-topic\n재고 복구 보상 트랜잭션"]
-        K9["order-cancel-topic"]
+        K5["stock-confirm-topic\n결제 성공 → DB 재고 확정"]
+        K6["stock-cancel-topic\n결제 실패(paymentConfirmed=false) → Redis 재고 복구"]
+        K7["stock-increase-topic\n환불(paymentConfirmed=true) → DB+Redis 재고 복구"]
+        K8["payment-refund-topic\n외부 환불 이벤트"]
     end
 
     subgraph INFRA["📊 Observability"]
@@ -137,31 +138,27 @@ flowchart TD
     ROUTER -->|"/product/**"| PRODUCT
     ROUTER -->|"/order/**"| ORDER
 
-    %% Outbox → Kafka 발행
+    %% 상품 생성 → ProductSnapshot 동기화
     POUT -->|"즉시 발행 or 재발행"| PUB
-    OOUT -->|"즉시 발행 or 재발행"| PUB
-    PAOUT -->|"즉시 발행 or 재발행"| PUB
     PUB -->|"publish"| K1
-    PUB -->|"publish"| K3
+    K1 -->|"consume 요약본 저장"| O2
+
+    %% 주문 → 결제 (OpenFeign 동기 호출)
+    O1A -->|"OpenFeign\nPOST /api/stock/reserve"| PRODUCT
+    O1B -->|"OpenFeign\nPOST /api/payments"| PAYMENT
+
+    %% 결제 후 보상 이벤트 (Outbox → Kafka)
+    OOUT -->|"즉시 발행 or 재발행"| PUB
     PUB -->|"publish"| K5
     PUB -->|"publish"| K6
     PUB -->|"publish"| K7
+    K5 -->|"consume 재고 DB 확정"| P2
+    K6 -->|"consume Redis 재고 복구"| P2
+    K7 -->|"consume DB+Redis 재고 복구"| P2
 
-    %% 상품 생성 → ProductSnapshot 동기화
-    K1 -->|"consume 요약본 저장"| O2
-
-    %% 주문 → 결제 플로우
-    K3 -->|"consume"| PA1
-    K3 -->|"consume 재고 차감"| P2
-
-    %% 보상 트랜잭션 Saga
-    K5 -->|"consume 주문 완료"| O4
-    K6 -->|"consume 주문 취소"| O4
-    K7 -->|"consume 주문 환불"| O4
-    O4 -->|"publish 재고 복구"| K8
-    P2 -->|"재고 부족 시 publish"| K9
-    K9 -->|"consume 주문 취소"| O4
-    K8 -->|"consume 재고 복구"| P2
+    %% 환불 플로우
+    K8 -->|"consume"| O4
+    O4 -->|"주문 REFUNDED + 보상이벤트"| O3
 
     %% 모니터링
     USER & PRODUCT & ORDER & PAYMENT -.->|"메트릭 노출"| MON
@@ -175,7 +172,7 @@ flowchart TD
 ### 👤 User Service (Auth 통합)
 > **역할**: 회원 가입/정보 관리, JWT 발급·검증, Spring Security 기반 인증 처리
 
-- **[Auth 통합]** `UserRegisterUseCase.register()`가 `@Transactional` 하나로 `UserService.creat()` + `AuthService.signup()`을 순차 호출 → 회원 DB와 인증 DB를 동시 저장, **Kafka 발행 없음**
+- **[Auth 통합]** `UserRegisterUseCase.register()`가 `@Transactional` 하나로 `UserService.create()` + `AuthService.signup()`을 순차 호출 → 회원 DB와 인증 DB를 동시 저장, **Kafka 발행 없음**
 - Spring Security + JWT (`jjwt 0.12.x`): `POST /api/auth/login` 로그인 시 Access Token 직접 발급
 - 비밀번호 변경(`POST /api/auth/update_password`)은 Auth DB를 직접 업데이트, Kafka 미사용
 - Flyway로 DB 스키마 버전 관리
@@ -191,7 +188,8 @@ flowchart TD
 
 - Redis Cache로 상품 목록/상세 캐싱 (`STOCK_TTL`, `DUPLICATE_TTL` 상수 분리)
 - 상품 등록 시 **Outbox 패턴**으로 `product-created-topic` 이벤트 저장 → Order Service가 ProductSnapshot 동기화
-- Kafka Consumer/Producer: 재고 차감·복원 이벤트 처리
+- Kafka Consumer: `stock-confirm-topic` 수신 → DB 재고 확정 / `stock-cancel-topic` · `stock-increase-topic` 수신 → 재고 복구
+- Order Service의 `ProductStockClient`(OpenFeign) 요청을 수신하여 Redis 재고 선점 처리
 - Resilience4j Circuit Breaker 적용
 - Prometheus 메트릭 노출 (재고 변동 모니터링)
 - corepay-common **1.1.1** 적용
@@ -201,13 +199,18 @@ flowchart TD
 ---
 
 ### 📋 Order Service
-> **역할**: 주문 생성 및 상태 관리, ProductSnapshot 기반 상품 정보 조회
+> **역할**: 주문 생성 및 상태 관리, 재고 선점·결제 요청, Outbox 기반 보상 이벤트 발행
 
-- **[OpenFeign 제거]** Product Service 직접 호출 없음 → `ProductSnapshotService`로 **Redis 캐시 조회 → DB Fallback** 방식으로 상품 정보 조회
+- **[상품 정보 조회 OpenFeign 제거]** `ProductSnapshotService`로 **Redis 캐시 조회 → DB Fallback** 방식으로 상품 정보 조회 (Product Service 직접 호출 없음)
+- **[재고 선점 · 결제 — OpenFeign 동기 호출 유지]**
+  - `ProductStockClient.reserveStock()`: 주문 생성 시 Product Service에 재고 선점 요청 → 성공 시 주문 상태 `STOCK_RESERVED`
+  - `PaymentFeignClient.pay()`: `POST /api/orders/{id}/payment` 호출 시 Payment Service에 결제 요청
 - Kafka Consumer: `product-created-topic` 수신 → ProductSnapshot 로컬 저장/업데이트
-- **Outbox 패턴**: 주문 생성 이벤트를 DB에 먼저 저장 후 즉시 발행 시도 → 실패 시 스케줄러가 재발행
-- Kafka Consumer: 결제 완료/실패/취소 이벤트 수신 후 주문 상태 업데이트
-- `OrderCancelledEvent`에 `paymentConfirmed` 필드 추가 (결제 확인 여부 구분)
+- **Outbox 패턴**: 결제 성공/실패/환불 후 보상 이벤트를 DB에 먼저 저장 후 즉시 발행 시도 → 실패 시 스케줄러가 재발행
+  - 결제 성공 → `stock-confirm-topic` (DB 재고 확정)
+  - 결제 실패 → `stock-cancel-topic` (`paymentConfirmed=false`, Redis 재고만 복구)
+  - 환불 → `stock-increase-topic` (`paymentConfirmed=true`, DB+Redis 재고 전체 복구)
+- Kafka Consumer: `payment-refund-topic` 수신 → 주문 상태 `REFUNDED` + 보상 이벤트 발행
 - corepay-common **1.1.1** 적용
 
 🔗 **[corepay_order 저장소 바로가기](https://github.com/jihoon-68/corepay_order)**
@@ -217,8 +220,7 @@ flowchart TD
 ### 💰 Payment Service
 > **역할**: 결제 처리 및 트랜잭션 관리, 결제 이력 저장
 
-- Kafka Consumer: 주문 이벤트 수신 후 결제 로직 실행
-- **Outbox 패턴**: 결제 성공/실패/취소 이벤트를 DB에 먼저 저장 후 즉시 발행 시도 → 실패 시 스케줄러가 재발행
+- **OpenFeign 수신**: Order Service의 `PaymentFeignClient` 동기 호출을 수신하여 결제 처리 후 HTTP 응답으로 결과 반환
 - Redis로 멱등성(idempotency) 처리 (중복 결제 방지)
 - 결제 실패 응답은 HTTP 200 + 바디로 통일 (402 응답 제거)
 - Resilience4j Circuit Breaker로 외부 PG 장애 격리
@@ -259,7 +261,7 @@ flowchart TD
 [회원가입]
 1. 클라이언트 → API Gateway → User Service  POST /api/users/signup
 2. UserRegisterUseCase.register() 실행 [@Transactional 단일 트랜잭션]
-   2-1. UserService.creat()   → 회원 정보 MySQL 저장 (BCrypt 해싱)
+   2-1. UserService.create()  → 회원 정보 MySQL 저장 (BCrypt 해싱)
    2-2. AuthService.signup()  → 인증용 AuthUser MySQL 저장
    (두 저장이 한 트랜잭션 내 실행 — Kafka 발행 없음)
 3. User Service → 클라이언트  201 Created 응답
@@ -274,24 +276,59 @@ flowchart TD
 
 ---
 
-## 🔁 주요 흐름 2: 주문 → 결제 이벤트 플로우 (Outbox 패턴 적용)
+## 🔁 주요 흐름 2: 주문 생성 → 재고 선점 → 결제 (2단계 플로우)
 
 ```
+── STEP 1: 주문 생성 & 재고 선점 ──────────────────────────────────────
 1. 클라이언트 → API Gateway (JWT 검증) → Order Service  POST /api/orders
+
 2. ProductSnapshotService.getProductInfos()
    2-1. Redis에서 product:snapshot:{id} 일괄 조회
    2-2. 캐시 미스 시 ProductSnapshot DB IN 쿼리로 Fallback
-   (OpenFeign 호출 없음, 동기 서비스 간 의존 없음)
-3. Order 저장 + OutboxEvent(order-created-topic) 저장 [같은 트랜잭션]
-   3-1. 즉시 Kafka 발행 시도 → 성공 시 SENT
-   3-2. 실패 시 PENDING 유지 → OutboxScheduler가 30초 후 재발행
-4. Payment Service → Kafka 소비 → 결제 처리
-5. Product Service → Kafka 소비 → 재고 차감
-6. Payment Service → OutboxEvent(payment-completed/failed-topic) 저장 후 발행
-7. Order Service → Kafka 소비 → 주문 상태 업데이트
+   (Product Service 직접 호출 없음)
+
+3. Order 저장 (상태: CREATED) → MySQL
+
+4. ProductStockClient.reserveStock() [OpenFeign 동기 호출]
+   → Product Service: Redis에 재고 선점
+   ├─ 성공: 주문 상태 → STOCK_RESERVED  →  클라이언트에 주문 ID 반환
+   └─ 실패: 주문 상태 → STOCK_FAILED   →  품절 상품 목록 반환
+
+── STEP 2: 결제 요청 (별도 API 호출) ──────────────────────────────────
+5. 클라이언트 → Order Service  POST /api/orders/{id}/payment
+   (주문 상태가 STOCK_RESERVED여야만 통과)
+
+6. 주문 상태 → PAYMENT_REQUESTED
+
+7. PaymentFeignClient.pay() [OpenFeign 동기 호출]
+   → Payment Service: 결제 처리 (Redis 멱등성 검증 → 결제 DB 저장)
+   → HTTP 응답으로 결과 반환
+
+   ├─ 결제 성공:
+   │   주문 상태 → COMPLETED
+   │   OutboxEvent(stock-confirm-topic) 저장 & 즉시 발행
+   │   → Product Service: Redis 선점 재고 → DB 재고 확정
+   │
+   ├─ 결제 실패:
+   │   주문 상태 → CANCELLED
+   │   OutboxEvent(stock-cancel-topic, paymentConfirmed=false) 저장 & 즉시 발행
+   │   → Product Service: Redis 선점 재고만 복구 (DB 미확정이므로)
+   │
+   └─ 타임아웃 / 예외:
+       주문 상태 → PAYMENT_REQUESTED 유지 (스케줄러 EXPIRED 처리 예정)
+
+── 환불 플로우 ─────────────────────────────────────────────────────────
+8. payment-refund-topic Kafka 수신 (OrderResultConsumer)
+9. 주문 상태 → REFUNDED
+10. OutboxEvent(stock-increase-topic, paymentConfirmed=true) 저장 & 즉시 발행
+    → Product Service: DB 재고 + Redis 재고 모두 복구
 ```
 
-> 💡 **설계 포인트 (Outbox 패턴)**: 기존 방식은 DB 저장 후 Kafka 발행 중 장애가 발생하면 이벤트가 유실되는 문제가 있었습니다. `OutboxEvent`를 비즈니스 엔티티와 **같은 트랜잭션**에 저장함으로써 발행 보장을 확보했습니다. 즉시 발행 성공 시 `SENT`로 즉시 업데이트하여 스케줄러 부하를 최소화하고, 실패 시에만 30초 후 재발행하는 이중 안전망 구조입니다.
+> 💡 **설계 포인트**
+> - **상품 정보 조회 vs 실시간 처리 분리**: 상품 정보 조회는 ProductSnapshot(Redis+DB)으로 비동기 조회하여 Product Service 의존성을 제거했지만, 재고 선점과 결제는 즉각적인 성공/실패 판단이 필요하므로 OpenFeign 동기 호출을 유지했습니다.
+> - **2단계 플로우**: 주문 생성과 결제를 분리하여 재고 선점 이후 클라이언트가 결제 정보를 확인하고 최종 결제를 요청하는 UX를 지원합니다.
+> - **paymentConfirmed 플래그**: 결제 확정 여부에 따라 재고 복구 범위(Redis만 vs DB+Redis)를 구분하여 정확한 보상 트랜잭션을 수행합니다.
+> - **Outbox 안전망**: 보상 이벤트(재고 확정/복구)도 Outbox 패턴으로 발행하여 결제 후 재고 상태 불일치를 방지합니다.
 
 ---
 
@@ -320,7 +357,7 @@ flowchart TD
 |---|---|
 | Kafka (비동기 통신) | 서비스 간 강결합 방지, 장애 격리, 재처리 용이 |
 | **Auth + User 통합** | **Kafka 동기화 제거 → 회원가입+인증을 단일 @Transactional로 보장, 운영 복잡도 감소** |
-| **OpenFeign 제거** | **Product Service 직접 호출 제거 → ProductSnapshot 조회로 의존성 차단** |
+| **상품 정보 조회 OpenFeign 제거** | **Product Service 직접 조회 제거 → ProductSnapshot(Redis+DB)으로 의존성 차단. 재고 선점·결제는 실시간 처리 필요로 OpenFeign 유지** |
 | **Outbox 패턴** | **DB 저장과 Kafka 발행을 동일 트랜잭션으로 묶어 이벤트 유실 원천 차단. 즉시 발행 + 30초 스케줄러 재발행 이중 안전망** |
 | **MDC 분산 트레이싱** | **X-Trace-Id를 HTTP/Kafka/비동기까지 전파하여 서비스 간 요청 흐름을 단일 traceId로 추적** |
 | ProductSnapshot (Redis + DB) | 상품 정보를 Order Service 내 로컬에 캐싱하여 빠른 주문 생성 지원 |
